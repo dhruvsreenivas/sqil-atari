@@ -5,6 +5,10 @@ import tensorflow as tf
 import numpy as np
 import random
 
+
+R_CONST = 1 # r_demo
+DONE_MULT = 1 # corresponds to r_abs/(1-gamma) = 0
+
 def huber_loss(x, delta=1.0):
     # https://en.wikipedia.org/wiki/Huber_loss
     return tf.where(
@@ -172,7 +176,7 @@ def get_wrapper_by_name(env, classname):
             raise ValueError("Couldn't find wrapper named %s"%classname)
 
 class ReplayBuffer(object):
-    def __init__(self, size, frame_history_len, lander=False):
+    def __init__(self, size, frame_history_len, lander=False, sqil=False):
         """This is a memory efficient implementation of the replay buffer.
 
         The sepecific memory optimizations use here are:
@@ -198,6 +202,7 @@ class ReplayBuffer(object):
         frame_history_len: int
             Number of memories to be retried for each observation.
         """
+        self.sqil = sqil
         self.lander = lander
 
         self.size = size
@@ -259,7 +264,17 @@ class ReplayBuffer(object):
             Array of shape (batch_size,) and dtype np.float32
         """
         assert self.can_sample(batch_size)
-        idxes = sample_n_unique(lambda: random.randint(0, self.num_in_buffer - 2), batch_size)
+        if not self.sqil:
+          idxes = sample_n_unique(lambda: random.randint(0, self.num_in_buffer - 2), batch_size)
+        else:
+          all_idxes = np.arange(0, self.num_in_buffer - 1, 1)
+          one_idxes = all_idxes[self.reward[:len(all_idxes)] == R_CONST]
+          zero_idxes = all_idxes[self.reward[:len(all_idxes)] == 0]
+          half_batch_size = int(batch_size / 2)
+          assert len(one_idxes) > half_batch_size, len(one_idxes)
+          assert len(zero_idxes) > half_batch_size, len(zero_idxes)
+          idxes = np.concatenate((np.random.choice(one_idxes, size=half_batch_size, replace=False), np.random.choice(zero_idxes, size=half_batch_size, replace=False)))
+          np.random.shuffle(idxes)
         return self._encode_sample(idxes)
 
     def encode_recent_observation(self):
@@ -325,11 +340,14 @@ class ReplayBuffer(object):
 
         ret = self.next_idx
         self.next_idx = (self.next_idx + 1) % self.size
+        if self.sqil:
+          while self.reward[self.next_idx] == R_CONST:
+            self.next_idx = (self.next_idx + 1) % self.size
         self.num_in_buffer = min(self.size, self.num_in_buffer + 1)
 
         return ret
 
-    def store_effect(self, idx, action, reward, done):
+    def store_effect(self, idx, action, reward, done, demo=False):
         """Store effects of action taken after obeserving frame stored
         at index idx. The reason `store_frame` and `store_effect` is broken
         up into two functions is so that once can call `encode_recent_observation`
@@ -347,6 +365,10 @@ class ReplayBuffer(object):
             True if episode was finished after performing that action.
         """
         self.action[idx] = action
+        if self.sqil:
+          reward = R_CONST if demo else 0
+          if done:
+            reward *= DONE_MULT
         self.reward[idx] = reward
         self.done[idx]   = done
 

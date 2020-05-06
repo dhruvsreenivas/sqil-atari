@@ -1,3 +1,4 @@
+from copy import deepcopy as copy
 import uuid
 import time
 import pickle
@@ -13,11 +14,29 @@ from dqn_utils import *
 
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs", "lr_schedule"])
 
+def load_tf_vars(sess, path):
+  saver = tf.train.Saver(tf.global_variables())
+  saver.restore(sess, path)
+
+def save_tf_vars(sess, path):
+  saver = tf.train.Saver(tf.global_variables())
+  saver.save(sess, save_path=path)
+
+def logsigmoid(a):
+  '''Equivalent to tf.log(tf.sigmoid(a))'''
+  return -tf.nn.softplus(-a)
+
+""" Reference: https://github.com/openai/imitation/blob/99fbccf3e060b6e6c739bdf209758620fcdefd3c/policyopt/thutil.py#L48-L51"""
+def logit_bernoulli_entropy(logits):
+  ent = (1.-tf.nn.sigmoid(logits))*logits - logsigmoid(logits)
+  return ent
+
 class QLearner(object):
 
   def __init__(
     self,
     env,
+    discrim,
     q_func,
     optimizer_spec,
     session,
@@ -25,15 +44,20 @@ class QLearner(object):
     stopping_criterion=None,
     replay_buffer_size=1000000,
     batch_size=32,
-    gamma=0.99,
+    gamma=1,
     learning_starts=50000,
     learning_freq=4,
     frame_history_len=4,
     target_update_freq=10000,
     grad_norm_clipping=10,
     rew_file=None,
-    double_q=True,
-    lander=False):
+    double_q=False,
+    lander=False,
+    sqil=False,
+    gen_demos=False,
+    temperature=1,
+    entcoeff=1e-3,
+    d_step=3):
     """Run Deep Q-learning algorithm.
 
     You can specify your own convnet using q_func.
@@ -92,6 +116,7 @@ class QLearner(object):
 
     self.target_update_freq = target_update_freq
     self.optimizer_spec = optimizer_spec
+    self.d_optimizer_spec = copy(optimizer_spec)
     self.batch_size = batch_size
     self.learning_freq = learning_freq
     self.learning_starts = learning_starts
@@ -112,6 +137,11 @@ class QLearner(object):
         img_h, img_w, img_c = self.env.observation_space.shape
         input_shape = (img_h, img_w, frame_history_len * img_c)
     self.num_actions = self.env.action_space.n
+
+    self.expert_obs_t_ph              = tf.placeholder(
+        tf.float32 if lander else tf.uint8, [None] + list(input_shape))
+    # placeholder for current action
+    self.expert_act_t_ph              = tf.placeholder(tf.int32,   [None])
 
     # set up placeholders
     # placeholder for current observation (or state)
@@ -139,6 +169,8 @@ class QLearner(object):
       obs_t_float   = tf.cast(self.obs_t_ph,   tf.float32) / 255.0
       obs_tp1_float = tf.cast(self.obs_tp1_ph, tf.float32) / 255.0
 
+      expert_obs_t_float   = tf.cast(self.expert_obs_t_ph,   tf.float32) / 255.0
+
     # Here, you should fill in your own code to compute the Bellman error. This requires
     # evaluating the current and next Q-values and constructing the corresponding error.
     # TensorFlow will differentiate this error for you, you just need to pass it to the
@@ -155,10 +187,30 @@ class QLearner(object):
     # And then you can obtain the variables like this:
     # q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
     # Older versions of TensorFlow may require using "VARIABLES" instead of "GLOBAL_VARIABLES"
-    # Tip: use huber_loss (from dqn_utils) instead of squared error when defining self.total_error
     ######
 
-    # YOUR CODE HERE
+    q_t_values = q_func(obs_t_float, self.num_actions, scope='q_func', reuse=False)
+    self.q_t = tf.reduce_sum(q_t_values * tf.one_hot(self.act_t_ph, self.num_actions), axis=1)
+    q_tp1_values = q_func(obs_tp1_float, self.num_actions, scope='target_q_func', reuse=False)
+
+    if double_q:
+      raise NotImplementedError
+      q_tp1_using_online_net = q_func(obs_tp1_float, self.num_actions, scope="q_func", reuse=True)
+      q_tp1_best_using_online_net = tf.argmax(q_tp1_using_online_net, axis=1)
+      q_tp1 = tf.reduce_sum(q_tp1_values * tf.one_hot(q_tp1_best_using_online_net, self.num_actions), axis=1)
+    else:
+      q_tp1 = tf.reduce_logsumexp(q_tp1_values, axis=1)
+
+    target_q_t = self.rew_t_ph + gamma * q_tp1 * (1. - self.done_mask_ph)
+    target_q_t = tf.stop_gradient(target_q_t)
+    td_error = self.q_t - target_q_t
+    self.total_error = tf.reduce_mean(td_error**2)
+
+    q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
+    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
+
+    gumbel_noise = -tf.log(-tf.log(tf.random_uniform(tf.shape(q_t_values))))
+    self.act = tf.argmax(temperature*q_t_values + gumbel_noise, axis=1)
 
     ######
 
@@ -176,8 +228,7 @@ class QLearner(object):
     self.update_target_fn = tf.group(*update_target_fn)
 
     # construct the replay buffer
-    self.replay_buffer = ReplayBuffer(replay_buffer_size, frame_history_len, lander=lander)
-    self.replay_buffer_idx = None
+    self.replay_buffer = ReplayBuffer(replay_buffer_size, frame_history_len, lander=lander, sqil=sqil)
 
     ###############
     # RUN ENV     #
@@ -192,10 +243,63 @@ class QLearner(object):
     self.start_time = None
     self.t = 0
 
+    # BEGIN GAIL CODE
+    # based on https://github.com/openai/baselines/blob/master/baselines/gail/adversary.py
+
+    generator_logits = discrim(obs_t_float, tf.cast(tf.one_hot(self.act_t_ph, self.num_actions), tf.float32), scope='discrim', reuse=False)
+    expert_logits = discrim(expert_obs_t_float, tf.cast(tf.one_hot(self.expert_act_t_ph, self.num_actions), tf.float32), scope='discrim', reuse=True)
+
+    # Build accuracy
+    generator_acc = tf.reduce_mean(tf.to_float(tf.nn.sigmoid(generator_logits) < 0.5))
+    expert_acc = tf.reduce_mean(tf.to_float(tf.nn.sigmoid(expert_logits) > 0.5))
+    # Build regression loss
+    # let x = logits, z = targets.
+    # z * -log(sigmoid(x)) + (1 - z) * -log(1 - sigmoid(x))
+    generator_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=generator_logits, labels=tf.zeros_like(generator_logits))
+    generator_loss = tf.reduce_mean(generator_loss)
+    expert_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=expert_logits, labels=tf.ones_like(expert_logits))
+    expert_loss = tf.reduce_mean(expert_loss)
+    # Build entropy loss
+    logits = tf.concat([generator_logits, expert_logits], 0)
+    entropy = tf.reduce_mean(logit_bernoulli_entropy(logits))
+    entropy_loss = -entcoeff*entropy
+    # Loss + Accuracy terms
+    self.total_loss = generator_loss + expert_loss + entropy_loss
+    # Build Reward for policy
+    self.reward_op = -tf.log(1-tf.nn.sigmoid(generator_logits)+1e-8)
+
+    self.d_learning_rate = tf.placeholder(tf.float32, (), name="d_learning_rate")
+    self.d_optimizer = self.optimizer_spec.constructor(learning_rate=self.d_learning_rate, **self.d_optimizer_spec.kwargs)
+    d_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='discrim')
+    self.d_train_fn = minimize_and_clip(self.d_optimizer, self.total_loss,
+                 var_list=d_vars, clip_val=grad_norm_clipping)
+
+    self.d_step = d_step
+
+    self.demo_buffer = ReplayBuffer(replay_buffer_size, frame_history_len, lander=lander, sqil=sqil)
+    with open('demos.pkl', 'rb') as f:
+      demos = pickle.load(f)
+    for demo in demos:
+      for obs, act, rew, done in demo:
+        replay_buffer_idx = self.demo_buffer.store_frame(obs)
+        self.demo_buffer.store_effect(replay_buffer_idx, act, 0, done, demo=True)
+
+    initialize_interdependent_variables(self.session, d_vars, {})
+
+    # END GAIL CODE
+
+  def d_reward(self, obses, acts):
+    feed_dict = {
+      self.obs_t_ph: obses,
+      self.act_t_ph: acts
+    }
+    rs = self.session.run(self.reward_op, feed_dict=feed_dict)
+    return rs
+
   def stopping_criterion_met(self):
     return self.stopping_criterion is not None and self.stopping_criterion(self.env, self.t)
 
-  def step_env(self):
+  def step_env(self, demo=False):
     ### 2. Step the env and store the transition
     # At this point, "self.last_obs" contains the latest observation that was
     # recorded from the simulator. Here, your code needs to store this
@@ -228,7 +332,27 @@ class QLearner(object):
 
     #####
 
-    # YOUR CODE HERE
+    replay_buffer_idx = self.replay_buffer.store_frame(self.last_obs)
+    enc_last_obs = self.replay_buffer.encode_recent_observation()
+
+    if not self.model_initialized:
+      action = np.random.choice(range(self.num_actions))
+    else:
+      action = self.session.run(self.act, feed_dict={self.obs_t_ph: enc_last_obs[None, :]})[0]
+
+    obs = copy(self.last_obs)
+    self.last_obs, _, done, info = self.env.step(action)
+
+    # discrim rewards get evaluated in batches in line 401, so this r is just a dummy variable
+    r = 0
+
+    self.replay_buffer.store_effect(replay_buffer_idx, action, r, done)
+
+    if done:
+      self.last_obs = self.env.reset()
+
+    if demo:
+      return obs, action, r, done
 
   def update_model(self):
     ### 3. Perform experience replay and train the network.
@@ -273,9 +397,44 @@ class QLearner(object):
       # variable self.num_param_updates useful for this (it was initialized to 0)
       #####
 
-      # YOUR CODE HERE
+      obs_batch, act_batch, _, next_obs_batch, done_mask = self.replay_buffer.sample(self.batch_size)
+
+      rew_batch = np.squeeze(self.d_reward(obs_batch, act_batch)) # compute discrim rewards
+
+      if not self.model_initialized:
+        initialize_interdependent_variables(self.session, tf.global_variables(), {
+          self.obs_t_ph: obs_batch,
+          self.obs_tp1_ph: next_obs_batch
+        })
+        self.model_initialized = True
+
+      feed_dict = {
+        self.obs_t_ph: obs_batch,
+        self.act_t_ph: act_batch,
+        self.rew_t_ph: rew_batch,
+        self.obs_tp1_ph: next_obs_batch,
+        self.done_mask_ph: done_mask,
+        self.learning_rate: self.optimizer_spec.lr_schedule.value(self.t)
+      }
+      self.session.run([self.total_error, self.train_fn], feed_dict=feed_dict)
+
+      if self.num_param_updates % self.target_update_freq == 0:
+        self.session.run(self.update_target_fn)
 
       self.num_param_updates += 1
+
+      if self.num_param_updates % self.d_step == 0:
+        # train discrim
+        obs_batch, act_batch = self.replay_buffer.sample(self.batch_size)[:2]
+        exp_obs_batch, exp_act_batch = self.demo_buffer.sample(self.batch_size)[:2]
+        feed_dict = {
+          self.obs_t_ph: obs_batch,
+          self.act_t_ph: act_batch,
+          self.expert_obs_t_ph: exp_obs_batch,
+          self.expert_act_t_ph: exp_act_batch,
+          self.d_learning_rate: self.d_optimizer_spec.lr_schedule.value(self.t)
+        }
+        self.session.run([self.total_loss, self.d_train_fn], feed_dict=feed_dict)
 
     self.t += 1
 
@@ -286,7 +445,10 @@ class QLearner(object):
       self.mean_episode_reward = np.mean(episode_rewards[-100:])
 
     if len(episode_rewards) > 100:
-      self.best_mean_episode_reward = max(self.best_mean_episode_reward, self.mean_episode_reward)
+      if self.mean_episode_reward > self.best_mean_episode_reward:
+        self.best_mean_episode_reward = self.mean_episode_reward
+        #if self.model_initialized:
+        #  save_tf_vars(self.session, '/home/sid/hw-private/hw3_soln/q_func_chkpt.tf')
 
     if self.t % self.log_every_n_steps == 0 and self.model_initialized:
       print("Timestep %d" % (self.t,))
@@ -307,11 +469,12 @@ class QLearner(object):
 
 def learn(*args, **kwargs):
   alg = QLearner(*args, **kwargs)
-  while not alg.stopping_criterion_met():
-    alg.step_env()
-    # at this point, the environment should have been advanced one step (and
-    # reset if done was true), and self.last_obs should point to the new latest
-    # observation
-    alg.update_model()
-    alg.log_progress()
+  if not kwargs.get('gen_demos', False):
+    while not alg.stopping_criterion_met():
+      alg.step_env()
+      # at this point, the environment should have been advanced one step (and
+      # reset if done was true), and self.last_obs should point to the new latest
+      # observation
+      alg.update_model()
+      alg.log_progress()
 

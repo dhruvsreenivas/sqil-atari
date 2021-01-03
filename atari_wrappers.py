@@ -22,6 +22,24 @@ class NoopResetEnv(gym.Wrapper):
             obs, _, _, _ = self.env.step(0)
         return obs
 
+# from OpenAI RND atari wrappers class
+class StickyActionEnv(gym.Wrapper):
+    def __init__(self, env, p=0.25):
+        super(StickyActionEnv, self).__init__(env)
+        self.p = p
+        self.last_action = 0
+    
+    def reset(self):
+        self.last_action = 0
+        return self.env.reset()
+
+    def step(self, action):
+        if self.unwrapped.np_random.uniform() < self.p:
+            action = self.last_action
+        self.last_action = action
+        obs, reward, done, info = self.env.step(action)
+        return obs, reward, done, info
+
 class FireResetEnv(gym.Wrapper):
     def __init__(self, env=None):
         """Take action on reset for environments that are fixed until firing."""

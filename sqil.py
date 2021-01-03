@@ -104,9 +104,11 @@ def get_session():
     print("AVAILABLE GPUS: ", get_available_gpus())
     return session
 
-def get_env(task, seed):
-    env = gym.make('BreakoutNoFrameskip-v4')
-    #env = gym.make('PongNoFrameskip-v4')
+def get_env(task, seed, sticky=False):
+    #env = gym.make('BreakoutNoFrameskip-v4')
+    env = gym.make('PongNoFrameskip-v4')
+    if sticky:
+        env = StickyActionEnv(env)
 
     set_global_seeds(seed)
     env.seed(seed)
@@ -119,13 +121,13 @@ def get_env(task, seed):
 
 def main():
     # Get Atari games.
-    task = gym.make('BreakoutNoFrameskip-v4')
-    #task = gym.make('PongNoFrameskip-v4')
+    #task = gym.make('BreakoutNoFrameskip-v4')
+    task = gym.make('PongNoFrameskip-v4')
 
     # Run training
     seed = random.randint(0, 9999)
     print('random seed = %d' % seed)
-    env = get_env(task, seed)
+    env = get_env(task, seed, sticky=True)
     session = get_session()
     atari_learn(env, session, num_timesteps=2e8)
 

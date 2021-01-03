@@ -186,10 +186,10 @@ class QLearner(object):
     td_error = self.q_t - target_q_t
     self.total_error = tf.reduce_mean(td_error**2)
 
-    q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
-    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
+    q_func_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
+    target_q_func_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
 
-    gumbel_noise = -tf.log(-tf.log(tf.random_uniform(tf.shape(q_t_values))))
+    gumbel_noise = -tf.math.log(-tf.math.log(tf.random.uniform(tf.shape(q_t_values))))
     if gen_demos:
       temperature = 100
     self.act = tf.argmax(temperature*q_t_values + gumbel_noise, axis=1)
@@ -228,11 +228,10 @@ class QLearner(object):
     if sqil:
       with open('demos.pkl', 'rb') as f:
         demos = pickle.load(f)
-      for demo in demos:
-        for obs, act, rew, done in demo:
-          replay_buffer_idx = self.replay_buffer.store_frame(obs)
-          rew = None
-          self.replay_buffer.store_effect(replay_buffer_idx, act, rew, done, demo=True)
+      for obs, act, rew, done in demos:
+        replay_buffer_idx = self.replay_buffer.store_frame(obs)
+        rew = None
+        self.replay_buffer.store_effect(replay_buffer_idx, act, rew, done, demo=True)
       print(self.replay_buffer.num_in_buffer)
       print('demos loaded')
     if gen_demos:

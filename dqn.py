@@ -122,20 +122,21 @@ class QLearner(object):
         input_shape = self.env.observation_space.shape
     else:
         img_h, img_w, img_c = self.env.observation_space.shape
-        input_shape = (img_h, img_w, frame_history_len * img_c)
+        input_shape = (4 * img_h, img_w, frame_history_len * img_c) # added 4 in order to make shapes match
+        print('INPUT SHAPE: ' + str(input_shape))
     self.num_actions = self.env.action_space.n
 
     # set up placeholders
     # placeholder for current observation (or state)
     self.obs_t_ph              = tf.placeholder(
-        tf.float32 if lander else tf.uint8, [None] + list(input_shape))
+        tf.float32 if lander else tf.uint8, [None] + list(input_shape)) # 64 here too
     # placeholder for current action
     self.act_t_ph              = tf.placeholder(tf.int32,   [None])
     # placeholder for current reward
     self.rew_t_ph              = tf.placeholder(tf.float32, [None])
     # placeholder for next observation (or state)
     self.obs_tp1_ph            = tf.placeholder(
-        tf.float32 if lander else tf.uint8, [None] + list(input_shape))
+        tf.float32 if lander else tf.uint8, [64] + list(input_shape)) # replaced None with 64 here in the list brackets in case need to change back
     # placeholder for end of episode mask
     # this value is 1 if the next state corresponds to the end of an episode,
     # in which case there is no Q-value at the next state; at the end of an
@@ -358,6 +359,7 @@ class QLearner(object):
       #####
 
       obs_batch, act_batch, rew_batch, next_obs_batch, done_mask = self.replay_buffer.sample(self.batch_size)
+      # print('Next observation shape: ' + str(next_obs_batch.shape))
 
       if not self.model_initialized:
         initialize_interdependent_variables(self.session, tf.global_variables(), {
@@ -420,6 +422,9 @@ def learn(*args, **kwargs):
       # at this point, the environment should have been advanced one step (and
       # reset if done was true), and self.last_obs should point to the new latest
       # observation
+      #print('stepped env')
       alg.update_model()
+      #print('updated model')
       alg.log_progress()
+      #print('logged progress')
 

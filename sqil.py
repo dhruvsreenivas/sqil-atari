@@ -16,6 +16,7 @@ def atari_model(img_in, num_actions, scope, reuse=False):
     # as described in https://storage.googleapis.com/deepmind-data/assets/papers/DeepMindNature14236Paper.pdf
     with tf.variable_scope(scope, reuse=reuse):
         out = img_in
+        print('input shape: ' + str(out.shape)) # this is (64, 1, 84, 336) as of now, need to make it such that 4 frames are added in
         with tf.variable_scope("convnet"):
             # original architecture
             out = layers.convolution2d(out, num_outputs=32, kernel_size=8, stride=4, activation_fn=tf.nn.relu)
@@ -107,8 +108,6 @@ def get_session():
 def get_env(task, seed, sticky=False):
     #env = gym.make('BreakoutNoFrameskip-v4')
     env = gym.make('PongNoFrameskip-v4')
-    if sticky:
-        env = StickyActionEnv(env)
 
     set_global_seeds(seed)
     env.seed(seed)
@@ -116,6 +115,8 @@ def get_env(task, seed, sticky=False):
     expt_dir = '/tmp/hw3_vid_dir2/'
     env = wrappers.Monitor(env, osp.join(expt_dir, "gym"), force=True, video_callable=False)
     env = wrap_deepmind(env)
+    if sticky:
+        env = StickyActionEnv(env)
 
     return env
 
@@ -128,6 +129,8 @@ def main():
     seed = random.randint(0, 9999)
     print('random seed = %d' % seed)
     env = get_env(task, seed, sticky=True)
+    print('last action test')
+    print(env.last_action)
     session = get_session()
     atari_learn(env, session, num_timesteps=2e8)
 

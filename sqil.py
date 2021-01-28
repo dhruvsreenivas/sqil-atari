@@ -126,13 +126,13 @@ def main():
     task = gym.make('PongNoFrameskip-v4')
 
     # Run training
-    seed = random.randint(0, 9999)
+    seed = 69
     print('random seed = %d' % seed)
     env = get_env(task, seed, sticky=True)
     print('last action test')
     print(env.last_action)
     session = get_session()
-    atari_learn(env, session, num_timesteps=2e8)
+    atari_learn(env, session, num_timesteps=2e6)
 
 if __name__ == "__main__":
     main()

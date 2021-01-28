@@ -227,7 +227,7 @@ class QLearner(object):
     self.t = 0
 
     if sqil:
-      with open('demos.pkl', 'rb') as f:
+      with open('demos_spaceinvaders.pkl', 'rb') as f:
         demos = pickle.load(f)
       for obs, act, rew, done in demos:
         replay_buffer_idx = self.replay_buffer.store_frame(obs)
@@ -254,7 +254,7 @@ class QLearner(object):
         # breakout:
         if rtn >= 300: # since breakout expert isn't perfect, only keep good demonstrations
           demos.append(demo)
-          with open('demos.pkl', 'wb') as f:
+          with open('demos_spaceinvaders.pkl', 'wb') as f:
             pickle.dump(demos, f, pickle.HIGHEST_PROTOCOL)
         # pong:
         #demos.append(demo)
